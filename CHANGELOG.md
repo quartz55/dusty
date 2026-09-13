@@ -23,6 +23,8 @@ All notable changes to this project will be documented in this file.
   `.dir`, `.none`) and are shared by `ClientConfig.tls.ca` and `ServerConfig.tls.client_auth.ca`.
 - Fix memory leak when a client connection fails to initialize (e.g. a rejected TLS handshake): the
   connection arena was not released.
+- Added streaming request bodies to the HTTP client: set `FetchOptions.body_len` and `body_writer`
+  to send a body straight to the connection instead of buffering it in memory first.
 
 ## [0.2.0] - 2026-04-26
 

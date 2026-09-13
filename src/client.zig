@@ -135,11 +135,36 @@ pub const TlsConfig = struct {
     pub const Path = config_mod.TlsPath;
 };
 
+/// A streaming request body producer. Set `FetchOptions.body_writer` to send
+/// a body without buffering it in memory first. The client sends
+/// `Content-Length: body_len` and then calls `write` with the connection
+/// writer, which must produce exactly `body_len` bytes.
+///
+/// `write` runs once per request attempt. Retries and redirects run it
+/// again, so it must be idempotent: reset any internal cursor and emit the
+/// same bytes every time.
+///
+/// A `WriteFailed` from the connection writer keeps its meaning: the fetch
+/// maps it to the connection's write error. Any other callback error
+/// surfaces as `error.BodyWriterFailed`.
+pub const BodyWriter = struct {
+    ctx: *anyopaque,
+    write: *const fn (ctx: *anyopaque, writer: *std.Io.Writer) anyerror!void,
+};
+
 /// Options for a single fetch request.
 pub const FetchOptions = struct {
     method: Method = .get,
     headers: ?*const Headers = null,
     body: ?[]const u8 = null,
+    /// Streaming request body. When set, `body` is ignored. The client sends
+    /// `Content-Length: body_len` and then calls `body_writer` to produce
+    /// exactly `body_len` bytes into the connection. Use this to send a body
+    /// without buffering it first. `body_writer` runs once per attempt and
+    /// must be idempotent (see `BodyWriter`). A callback failure surfaces as
+    /// `error.BodyWriterFailed`.
+    body_len: ?usize = null,
+    body_writer: ?BodyWriter = null,
     /// Override default redirect limit for this request.
     max_redirects: ?u8 = null,
     /// Decompress response body automatically (sends Accept-Encoding header).
@@ -1083,6 +1108,8 @@ pub const Client = struct {
             .protocol = state.protocol,
             .headers = state.options.headers,
             .body = state.options.body,
+            .body_len = state.options.body_len,
+            .body_writer = state.options.body_writer,
             .decompress = state.options.decompress,
             .strip_sensitive_headers = state.strip_sensitive_headers,
             .strip_body_headers = state.strip_body_headers,
@@ -1156,8 +1183,12 @@ pub const Client = struct {
                     if (redirect_options.method != .get and redirect_options.method != .head) {
                         redirect_options.method = .get;
                         redirect_options.body = null;
+                        redirect_options.body_len = null;
+                        redirect_options.body_writer = null;
                     } else if (status_code == 303) {
                         redirect_options.body = null;
+                        redirect_options.body_len = null;
+                        redirect_options.body_writer = null;
                     }
                 }
 
@@ -1173,7 +1204,7 @@ pub const Client = struct {
                     (state.protocol == .https and redirect_info.protocol == .http);
 
                 // Strip body-related headers when there is no body to send.
-                const redirect_strip_body = redirect_options.body == null;
+                const redirect_strip_body = redirect_options.body == null and redirect_options.body_writer == null;
 
                 // Compute Referer for the next hop (RFC 7231 §5.5.2).
                 // Don't send Referer when downgrading https→http (would leak in plaintext).
@@ -1244,6 +1275,8 @@ const WriteRequestOptions = struct {
     protocol: Protocol,
     headers: ?*const Headers = null,
     body: ?[]const u8 = null,
+    body_len: ?usize = null,
+    body_writer: ?BodyWriter = null,
     decompress: bool = true,
     strip_sensitive_headers: bool = false,
     strip_body_headers: bool = false,
@@ -1320,9 +1353,13 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
         try writer.print("Host: {s}:{d}\r\n", .{ opts.host, opts.port });
     }
 
-    // Content-Length for body
+    // Content-Length for body. The buffered slice and the streaming writer
+    // are mutually exclusive. Prefer the slice when both are set, so
+    // existing callers keep their behavior.
     if (opts.body) |b| {
         try writer.print("Content-Length: {d}\r\n", .{b.len});
+    } else if (opts.body_len) |len| {
+        try writer.print("Content-Length: {d}\r\n", .{len});
     }
 
     // User-provided headers
@@ -1384,9 +1421,18 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     // End of headers
     try writer.writeAll("\r\n");
 
-    // Body
+    // Body. The streaming writer runs only when no buffered body was
+    // given. It writes straight into the connection writer. The callback
+    // error set is open (`anyerror`), so it is narrowed here to keep the
+    // client's public error surface concrete: a `WriteFailed` stays on the
+    // connection-failure path, anything else becomes `BodyWriterFailed`.
     if (opts.body) |b| {
         try writer.writeAll(b);
+    } else if (opts.body_writer) |bw| {
+        bw.write(bw.ctx, writer) catch |err| switch (err) {
+            error.WriteFailed => return error.WriteFailed,
+            else => return error.BodyWriterFailed,
+        };
     }
 }
 
@@ -2257,4 +2303,92 @@ test "writeRequest: strips body headers when body removed" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Type") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Language") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
+}
+
+test "writeRequest: streams body from body_writer" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    const payload = "streamed-payload";
+    const StreamBody = struct {
+        payload: []const u8,
+        called: bool = false,
+        fn write(ctx: *anyopaque, w: *std.Io.Writer) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.called = true;
+            try w.writeAll(self.payload);
+        }
+    };
+    var stream_body: StreamBody = .{ .payload = payload };
+
+    const uri = try parseUrl("http://example.com/upload");
+    try writeRequest(&writer, .{
+        .method = .post,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .body_len = payload.len,
+        .body_writer = .{ .ctx = &stream_body, .write = StreamBody.write },
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 16\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, payload));
+    try std.testing.expect(stream_body.called);
+}
+
+test "writeRequest: buffered body wins over body_writer" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    const StreamBody = struct {
+        fn write(ctx: *anyopaque, w: *std.Io.Writer) anyerror!void {
+            _ = ctx;
+            _ = w;
+            return error.ShouldNotBeCalled;
+        }
+    };
+
+    const uri = try parseUrl("http://example.com/upload");
+    try writeRequest(&writer, .{
+        .method = .post,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .body = "buffered",
+        .body_len = 100,
+        .body_writer = .{ .ctx = undefined, .write = StreamBody.write },
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 8\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "buffered"));
+    try std.testing.expect(std.mem.indexOf(u8, written, "100") == null);
+}
+
+test "writeRequest: body_writer errors become BodyWriterFailed" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    const StreamBody = struct {
+        fn write(ctx: *anyopaque, w: *std.Io.Writer) anyerror!void {
+            _ = ctx;
+            _ = w;
+            return error.UserFailed;
+        }
+    };
+
+    const uri = try parseUrl("http://example.com/upload");
+    const result = writeRequest(&writer, .{
+        .method = .post,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .body_len = 4,
+        .body_writer = .{ .ctx = undefined, .write = StreamBody.write },
+    });
+    try std.testing.expectError(error.BodyWriterFailed, result);
 }
