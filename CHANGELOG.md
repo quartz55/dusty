@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Added streaming request bodies to the HTTP client: set `FetchOptions.body_len`
+  and `body_writer` to send a body straight to the connection instead of
+  buffering it in memory first.
+
 ## [0.5.0] - 2026-10-25
 
 This release adds file and asset serving, more ways to produce a response body, and a more reliable HTTP client, while making TLS, compression and memory use cheaper per connection.

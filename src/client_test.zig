@@ -102,6 +102,210 @@ test "Client: fetch GET request" {
     try client_future.await(io);
 }
 
+test "Client: fetch sends a streaming body" {
+    const io = std.testing.io;
+
+    const Ctx = struct {
+        received: [64]u8 = undefined,
+        received_len: usize = 0,
+    };
+    var ctx: Ctx = .{};
+
+    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    defer server.deinit();
+
+    server.router.post("/upload", struct {
+        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+            const received = (try req.body()) orelse "";
+            @memcpy(c.received[0..received.len], received);
+            c.received_len = received.len;
+            res.body = "ok";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(Ctx)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const port = server.address.ip.getPort();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/upload", .{port});
+
+    const StreamBody = struct {
+        payload: []const u8,
+        fn write(sink: *anyopaque, w: *std.Io.Writer) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(sink));
+            try w.writeAll(self.payload);
+        }
+    };
+    const payload = "streamed request payload";
+    var stream_body: StreamBody = .{ .payload = payload };
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var response = try client.fetch(url, .{
+        .method = .post,
+        .body_len = payload.len,
+        .body_writer = .{ .ctx = &stream_body, .write = StreamBody.write },
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(.ok, response.status());
+    try std.testing.expectEqualStrings(payload, ctx.received[0..ctx.received_len]);
+}
+
+test "Client: 302 redirect drops a streaming body" {
+    const io = std.testing.io;
+
+    const Ctx = struct {
+        location: []const u8 = "",
+        location_buf: [64]u8 = undefined,
+        final_method_is_get: bool = false,
+        final_has_content_length: bool = false,
+    };
+    var ctx: Ctx = .{};
+
+    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    defer server.deinit();
+
+    server.router.post("/redirect", struct {
+        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.status = .found;
+            try res.header("Location", c.location);
+        }
+    }.handle);
+
+    server.router.get("/ok", struct {
+        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+            c.final_method_is_get = req.method == .get;
+            c.final_has_content_length = req.headers.get("Content-Length") != null;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(Ctx)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const port = server.address.ip.getPort();
+    ctx.location = try std.fmt.bufPrint(&ctx.location_buf, "http://127.0.0.1:{d}/ok", .{port});
+
+    var redirect_buf: [64]u8 = undefined;
+    const redirect_url = try std.fmt.bufPrint(&redirect_buf, "http://127.0.0.1:{d}/redirect", .{port});
+
+    const StreamBody = struct {
+        payload: []const u8,
+        called: usize = 0,
+        fn write(sink: *anyopaque, w: *std.Io.Writer) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(sink));
+            self.called += 1;
+            try w.writeAll(self.payload);
+        }
+    };
+    const payload = "do not resend me";
+    var stream_body: StreamBody = .{ .payload = payload };
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var response = try client.fetch(redirect_url, .{
+        .method = .post,
+        .body_len = payload.len,
+        .body_writer = .{ .ctx = &stream_body, .write = StreamBody.write },
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(.ok, response.status());
+    try std.testing.expect(ctx.final_method_is_get);
+    try std.testing.expect(!ctx.final_has_content_length);
+    try std.testing.expectEqual(@as(usize, 1), stream_body.called);
+}
+
+test "Client: 307 redirect re-streams the body" {
+    const io = std.testing.io;
+
+    const Ctx = struct {
+        location: []const u8 = "",
+        location_buf: [64]u8 = undefined,
+        received: [64]u8 = undefined,
+        received_len: usize = 0,
+    };
+    var ctx: Ctx = .{};
+
+    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    defer server.deinit();
+
+    server.router.post("/redirect", struct {
+        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.status = .temporary_redirect;
+            try res.header("Location", c.location);
+        }
+    }.handle);
+
+    server.router.post("/sink", struct {
+        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+            const received = (try req.body()) orelse "";
+            @memcpy(c.received[0..received.len], received);
+            c.received_len = received.len;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(Ctx)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const port = server.address.ip.getPort();
+    ctx.location = try std.fmt.bufPrint(&ctx.location_buf, "http://127.0.0.1:{d}/sink", .{port});
+
+    var redirect_buf: [64]u8 = undefined;
+    const redirect_url = try std.fmt.bufPrint(&redirect_buf, "http://127.0.0.1:{d}/redirect", .{port});
+
+    const StreamBody = struct {
+        payload: []const u8,
+        called: usize = 0,
+        fn write(sink: *anyopaque, w: *std.Io.Writer) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(sink));
+            self.called += 1;
+            try w.writeAll(self.payload);
+        }
+    };
+    const payload = "send me twice";
+    var stream_body: StreamBody = .{ .payload = payload };
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var response = try client.fetch(redirect_url, .{
+        .method = .post,
+        .body_len = payload.len,
+        .body_writer = .{ .ctx = &stream_body, .write = StreamBody.write },
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(.ok, response.status());
+    try std.testing.expectEqualStrings(payload, ctx.received[0..ctx.received_len]);
+    try std.testing.expectEqual(@as(usize, 2), stream_body.called);
+}
+
 test "Client: connection pooling" {
     const io = std.testing.io;
 

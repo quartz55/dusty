@@ -42,6 +42,7 @@ pub const ClientConfig = @import("client.zig").ClientConfig;
 pub const TlsConfig = @import("client.zig").TlsConfig;
 pub const ClientResponse = @import("client.zig").ClientResponse;
 pub const FetchOptions = @import("client.zig").FetchOptions;
+pub const RequestBodyWriter = @import("client.zig").BodyWriter;
 pub const WebSocketClient = @import("client.zig").WebSocketClient;
 pub const WebSocketUpgradeOptions = @import("client.zig").WebSocketUpgradeOptions;
 
